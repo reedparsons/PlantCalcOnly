@@ -123,43 +123,44 @@ class PlantInventoryCalculator:
                 st.error(f"Table file not found: {st.session_state.current_table}")
                 return None
             
-            # Expected columns
-            expected_columns = [
-                "TransactionDate", "Action", "LotNum", "PlantForm", "Cultivar", 
-                "OpeningNumber", "NumberPlantsDestroyed", "ClosingNumber",
-                "WasteWeight", "WasteType", "Details", "HarvestWeight", "CureWeight", 
-                "BulkWeight", "DriedWeight"
-            ]
+            # Read CSV with date parsing disabled initially
+            df = pd.read_csv(st.session_state.current_table)
             
-            # Read CSV directly with expected columns
-            df = pd.read_csv(
-                st.session_state.current_table,
-                names=expected_columns,  # Use expected column names
-                header=0,  # Skip the first row (old header)
-                engine='python',
-                on_bad_lines='skip'
-            )
-            
-            # Fill any missing values with "NA"
-            df = df.fillna("NA")
-            
-            # Ensure all expected columns exist
-            for col in expected_columns:
-                if col not in df.columns:
-                    df[col] = "NA"
-            
-            # Reorder columns to match expected order
-            df = df[expected_columns]
-            
-            # Store the total number of records
-            st.session_state.last_total_records = len(df)
-            
-            return df
+            # Handle date conversion safely
+            try:
+                # Convert dates and handle invalid values
+                df['TransactionDate'] = pd.to_datetime(
+                    df['TransactionDate'].str.split().str[0],  # Take only the date part
+                    format='%Y-%m-%d', 
+                    errors='coerce'  # Invalid dates become NaT
+                )
+                
+                # Remove rows with invalid dates
+                invalid_dates = df['TransactionDate'].isna()
+                if invalid_dates.any():
+                    st.warning(f"Found {invalid_dates.sum()} rows with invalid dates. These rows will be excluded.")
+                    df = df[~invalid_dates]
+                
+                if df.empty:
+                    st.error("No valid data found after date processing")
+                    return None
+                    
+                min_date = df['TransactionDate'].min()
+                max_date = df['TransactionDate'].max()
+                
+                # Store total records
+                st.session_state.last_total_records = len(df)
+                
+                return df
+                
+            except Exception as e:
+                self.write_error_log(f"Error processing dates in transaction table: {str(e)}")
+                st.error(f"Error processing dates: {str(e)}")
+                return None
             
         except Exception as e:
-            error_msg = f"Error loading TransactionTable.csv: {str(e)}"
-            st.error(error_msg)
-            self.write_error_log(error_msg)
+            self.write_error_log(f"Error loading transaction table: {str(e)}")
+            st.error(f"Error loading table: {str(e)}")
             return None
 
     def save_calculations(self, metrics, filtered_df):
@@ -533,21 +534,28 @@ class PlantInventoryCalculator:
 
     def check_for_duplicates(self, edited_df, existing_df):
         """Check for duplicate entries and return duplicates and unique entries"""
-        # Create composite key for comparison
-        def create_key(df):
-            return df.apply(lambda row: f"{row['TransactionDate']}_{row['Action']}_{row['LotNum']}", axis=1)
-        
-        existing_keys = create_key(existing_df)
-        new_keys = create_key(edited_df)
-        
-        # Find duplicates and unique entries
-        duplicates = edited_df[new_keys.isin(existing_keys)]
-        unique_entries = edited_df[~new_keys.isin(existing_keys)]
-        
-        return duplicates, unique_entries
+        try:
+            # Create composite key for comparison
+            def create_key(df):
+                return df.apply(lambda row: f"{row['TransactionDate']}_{row['Action']}_{row['LotNum']}", axis=1)
+            
+            existing_keys = create_key(existing_df)
+            new_keys = create_key(edited_df)
+            
+            # Find duplicates and unique entries
+            duplicates = edited_df[new_keys.isin(existing_keys)]
+            unique_entries = edited_df[~new_keys.isin(existing_keys)]
+            
+            return duplicates, unique_entries
+            
+        except Exception as e:
+            error_msg = f"Error checking for duplicates: {str(e)}"
+            st.error(error_msg)
+            self.write_error_log(error_msg)
+            return pd.DataFrame(), edited_df  # Return empty duplicates and all entries as unique
 
     def save_with_duplicate_check(self, edited_df, filepath):
-        """Save data with duplicate checking"""
+        """Save data with duplicate checking and user confirmation"""
         try:
             if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
                 existing_df = pd.read_csv(filepath)
@@ -558,13 +566,14 @@ class PlantInventoryCalculator:
                     with st.expander("Show duplicate entries"):
                         st.dataframe(duplicates)
                     
-                    # Ask user if they want to proceed with saving unique entries
-                    if st.button("Save Unique Entries Only"):
-                        if not unique_entries.empty:
+                    # Add save confirmation for unique entries
+                    if not unique_entries.empty:
+                        st.info(f"Found {len(unique_entries)} new unique entries")
+                        if st.button("Save Unique Entries"):
                             unique_entries.to_csv(filepath, mode='a', header=False, index=False)
                             st.success(f"Saved {len(unique_entries)} new entries")
-                        else:
-                            st.info("No new entries to save (all were duplicates)")
+                    else:
+                        st.info("No new entries to save (all were duplicates)")
                 else:
                     # No duplicates, save all entries
                     edited_df.to_csv(filepath, mode='a', header=False, index=False)
@@ -575,8 +584,9 @@ class PlantInventoryCalculator:
                 st.success(f"Created new file with {len(edited_df)} entries")
                 
         except Exception as e:
-            st.error(f"Error saving data: {str(e)}")
-            self.write_error_log(f"Error during save: {str(e)}")
+            error_msg = f"Error saving data: {str(e)}"
+            st.error(error_msg)
+            self.write_error_log(error_msg)
 
     def export_to_pdf(self, metrics, filtered_df, figures):
         """Export calculations and visualizations to PDF"""
@@ -725,37 +735,36 @@ class PlantInventoryCalculator:
         # Create filter columns
         col1, col2 = st.columns(2)
         
-        # Date range filter with date-only parsing
+        # Date range filter with error handling
         with col1:
             try:
-                # Convert dates and strip time component
-                df['TransactionDate'] = pd.to_datetime(
-                    df['TransactionDate'].str.split().str[0],  # Take only the date part
-                    format='%Y-%m-%d'
-                )
-                
-                min_date = df['TransactionDate'].min()
-                max_date = df['TransactionDate'].max()
-                
-                start_date = pd.to_datetime(st.date_input(
-                    "Start Date",
-                    value=st.session_state.get('start_date', min_date.date()),
-                    min_value=min_date.date(),
-                    max_value=max_date.date(),
-                    key='start_date'
-                ))
-                
-                end_date = pd.to_datetime(st.date_input(
-                    "End Date",
-                    value=st.session_state.get('end_date', max_date.date()),
-                    min_value=min_date.date(),
-                    max_value=max_date.date(),
-                    key='end_date'
-                ))
+                if df is not None and not df.empty:
+                    min_date = df['TransactionDate'].min()
+                    max_date = df['TransactionDate'].max()
+                    
+                    # Use date components only for the date input
+                    start_date = pd.to_datetime(st.date_input(
+                        "Start Date",
+                        value=st.session_state.get('start_date', min_date.date()),
+                        min_value=min_date.date(),
+                        max_value=max_date.date(),
+                        key='start_date'
+                    ))
+                    
+                    end_date = pd.to_datetime(st.date_input(
+                        "End Date",
+                        value=st.session_state.get('end_date', max_date.date()),
+                        min_value=min_date.date(),
+                        max_value=max_date.date(),
+                        key='end_date'
+                    ))
+                else:
+                    st.error("No valid data available for date filtering")
+                    return
                 
             except Exception as e:
-                self.write_error_log(f"Error processing dates: {str(e)}")
-                st.error(f"Error processing dates: {str(e)}")
+                self.write_error_log(f"Error setting up date filters: {str(e)}")
+                st.error(f"Error setting up date filters: {str(e)}")
                 return
         
         with col2:
